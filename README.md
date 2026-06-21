@@ -1,4 +1,4 @@
-# My-personal-helper-scripts
+# My-lazy-scripts
 This is just a collection of scripts that make a few things easier for me.
 I use CachyOS myself, so I can't guarantee that it will work on other distributions.
 **Use at your own risk!**
