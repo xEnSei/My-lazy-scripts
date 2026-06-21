@@ -10,22 +10,24 @@ info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 
-# --- Root check ---
+# --- Root check / sudo escalation ---
 if [[ $EUID -ne 0 ]]; then
-    error "This script must be run as root (sudo $0)."
-    exit 1
+    exec sudo "$0" "$@"
 fi
 
 # --- Pacman lock check ---
 LOCK="/var/lib/pacman/db.lck"
 if [[ -f "$LOCK" ]]; then
-    warn "Pacman lockfile detected. Removing $LOCK ..."
+    if pgrep -x pacman &>/dev/null; then
+        error "Pacman läuft aktiv – Lockfile wird nicht entfernt. Abbruch."
+        exit 1
+    fi
+    warn "Verwaistes Lockfile gefunden. Entferne $LOCK ..."
     rm -f "$LOCK"
 fi
 
 # --- Step 1: Remove corrupt download fragments ---
 info "[1/4] Removing corrupt download fragments..."
-# Eliminates the physical cause of "Error reading fd 7"
 shopt -s nullglob
 fragments=(/var/cache/pacman/pkg/download-*)
 if (( ${#fragments[@]} > 0 )); then
@@ -39,22 +41,56 @@ shopt -u nullglob
 # --- Step 2: Optimize mirror infrastructure ---
 info "[2/4] Validating and optimizing mirror infrastructure..."
 if command -v cachyos-rate-mirrors &>/dev/null; then
-    cachyos-rate-mirrors
+    if ! timeout 240 cachyos-rate-mirrors; then
+        warn "cachyos-rate-mirrors fehlgeschlagen oder Timeout – wird übersprungen."
+    fi
 else
     warn "cachyos-rate-mirrors not found – mirror optimization skipped."
 fi
 
 # --- Step 3: Reconstruct keyrings ---
 info "[3/4] Reconstructing trust anchors (keyrings)..."
-# Correct order: init → sync DB → install keyring packages → populate
-# --populate reads from /usr/share/pacman/keyrings/, which is written by the packages
+
+GNUPG_DIR="/etc/pacman.d/gnupg"
+GNUPG_BAK="${GNUPG_DIR}.bak"
+
+# Backup existing keyring before destructive reset
+if [[ -d "$GNUPG_DIR" ]]; then
+    rm -rf "$GNUPG_BAK"
+    cp -a "$GNUPG_DIR" "$GNUPG_BAK"
+    info "  Keyring-Backup erstellt: $GNUPG_BAK"
+fi
+
+# Full reset to handle corrupt keyring state
+rm -rf "$GNUPG_DIR"
+
+# Restore backup and abort if any keyring step fails
+keyring_restore() {
+    error "Keyring-Rekonstruktion fehlgeschlagen – stelle Backup wieder her."
+    rm -rf "$GNUPG_DIR"
+    if [[ -d "$GNUPG_BAK" ]]; then
+        cp -a "$GNUPG_BAK" "$GNUPG_DIR"
+        warn "Backup wiederhergestellt. System-Zustand: unverändert."
+    else
+        error "Kein Backup vorhanden – manueller Eingriff erforderlich."
+    fi
+    exit 1
+}
+trap keyring_restore ERR
+
 pacman-key --init
-pacman -Sy --noconfirm archlinux-keyring cachyos-keyring
+# Populate from local /usr/share/pacman/keyrings/ before any network sync
+# pacman -Syu needs valid keys to verify repo signatures
 pacman-key --populate archlinux cachyos
+pacman -Syu --noconfirm archlinux-keyring cachyos-keyring
+
+# Keyring intact – disable error trap
+trap - ERR
 
 # --- Step 4: Full system sync ---
 info "[4/4] Initiating full system synchronization..."
-pacman -Su  # No -y needed – DB already current from step 3
+# DBs already current from Step 3 – no -y needed
+pacman -Su
 
 echo ""
 echo -e "${GREEN}Integrity restored. System status: Nominal.${NC}"
