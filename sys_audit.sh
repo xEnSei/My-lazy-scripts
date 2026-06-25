@@ -4,193 +4,95 @@
 # SYSTEM-AUDIT SCRIPT
 # ==============================================================================
 
+# 0. Error handling & cleanup
+trap '[ -n "$MONITOR_TMPFILE" ] && rm -f "$MONITOR_TMPFILE" 2>/dev/null
+      [ -n "$AUR_TMPFILE" ]     && rm -f "$AUR_TMPFILE"     2>/dev/null' EXIT
+trap 'echo "Fehler: Skript unterbrochen"; exit 130' INT TERM
+
 # 1. Privilege separation & root check
-# realpath resolves symlinks and relative paths before exec
 SCRIPT_PATH=$(realpath "$0")
 
 # User-session data must be collected BEFORE sudo relaunch.
-# kscreen-doctor requires an active Wayland/DBus session which root cannot access.
+# kscreen-doctor and AUR helpers require an active user session.
 MONITOR_TMPFILE=$(mktemp /tmp/sys_audit_monitors.XXXXXX)
-if [ "$EUID" -ne 0 ] && command -v kscreen-doctor >/dev/null 2>&1; then
-    # WAYLAND_DISPLAY must be exported explicitly; fish does not auto-export to bash subshells.
-    # Probe wayland-0 and wayland-1 as fallbacks if the variable is unset.
-    _wd="${WAYLAND_DISPLAY:-}"
-    if [ -z "$_wd" ]; then
-        for _sock in wayland-0 wayland-1; do
-            [ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$_sock" ] && _wd="$_sock" && break
-        done
-    fi
-    # ddcutil reads monitor names via I2C (works with NVIDIA open driver).
-    # Build a connector->name map: "Display N" order from ddcutil matches
-    # kscreen output index order. We pair them by position.
-    declare -A _MON_NAMES=()
-    if command -v ddcutil >/dev/null 2>&1; then
-        mapfile -t _ddcutil_names < <(
-            ddcutil detect --verbose 2>/dev/null             | grep "Monitor Model Id:"             | sed 's/.*Monitor Model Id: *//'             | sed 's/-[0-9]*$//'             | sed 's/-/ /g'
-        )
-        mapfile -t _kscreen_connectors < <(
-            WAYLAND_DISPLAY="$_wd" kscreen-doctor -o 2>/dev/null             | sed 's/\x1b\[[0-9;]*m//g'             | grep "^Output:"             | sed -E 's/^Output: ([0-9]+) ([A-Z]+-[0-9]+).*/\1 \2/'
-        )
-        for _entry in "${_kscreen_connectors[@]}"; do
-            _idx=$(echo "$_entry" | awk '{print $1}')
-            _conn=$(echo "$_entry" | awk '{print $2}')
-            _name="${_ddcutil_names[$_idx-1]:-}"
-            [ -n "$_name" ] && _MON_NAMES["$_conn"]="$_name"
-        done
-    fi
-
-    WAYLAND_DISPLAY="$_wd" kscreen-doctor -o 2>/dev/null \
-        | sed 's/\x1b\[[0-9;]*m//g' \
-        | grep -vE "^\s+Modes:" \
-        | grep -vE "^\s+Custom modes:" \
-        | grep -vE "^\s+replication source:" \
-        | grep -vE "^\s+priority [0-9]" \
-        | sed -E 's/^(Output: [0-9]+ ([A-Z]+-[0-9]+)) [a-f0-9-]{36}/\1/' \
-        | awk '/^Output:/{if(NR>1) print ""} {print}' \
-        | while IFS= read -r _line; do
-            if [[ "$_line" =~ ^Output:\ [0-9]+\ ([A-Z]+-[0-9]+) ]]; then
-                _conn="${BASH_REMATCH[1]}"
-                _name="${_MON_NAMES[$_conn]:-}"
-                [ -n "$_name" ] && _line="$_line  [$_name]"
-            fi
-            echo "$_line"
-          done \
-        > "$MONITOR_TMPFILE"
-fi
+AUR_TMPFILE=$(mktemp /tmp/sys_audit_aur.XXXXXX)
 
 if [ "$EUID" -ne 0 ]; then
+    # --- Monitor-Daten sammeln (Wayland/DBus User-Session) ---
+    if command -v kscreen-doctor >/dev/null 2>&1; then
+        _wd="${WAYLAND_DISPLAY:-}"
+        if [ -z "$_wd" ]; then
+            for _sock in wayland-0 wayland-1; do
+                [ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$_sock" ] && _wd="$_sock" && break
+            done
+        fi
+        if [ -n "$_wd" ]; then
+            WAYLAND_DISPLAY="$_wd" kscreen-doctor -o 2>/dev/null \
+                | sed 's/\x1b\[[0-9;]*m//g' \
+                > "$MONITOR_TMPFILE"
+        fi
+    fi
+
+    # --- AUR-Daten sammeln (paru/yay nicht als root lauffähig) ---
+    _aur_help=""
+    if command -v paru >/dev/null 2>&1; then
+        _aur_help="paru"
+    elif command -v yay >/dev/null 2>&1; then
+        _aur_help="yay"
+    fi
+
+    if [ -n "$_aur_help" ]; then
+        {
+            printf "HELPER=%s\n" "$_aur_help"
+            printf "UPDATES_START\n"
+            $_aur_help -Qu 2>/dev/null || true
+            printf "UPDATES_END\n"
+            printf "FOREIGN_START\n"
+            $_aur_help -Qm 2>/dev/null || true
+            printf "FOREIGN_END\n"
+        } > "$AUR_TMPFILE"
+    else
+        printf "HELPER=none\n" > "$AUR_TMPFILE"
+    fi
+
     sudo -v || { echo "Error: sudo authentication required."; exit 1; }
-    exec sudo bash "$SCRIPT_PATH" --monitor-tmpfile "$MONITOR_TMPFILE" "$@"
+    exec sudo /usr/bin/env bash "$SCRIPT_PATH" \
+        --monitor-tmpfile "$MONITOR_TMPFILE" \
+        --aur-tmpfile "$AUR_TMPFILE" \
+        "$@"
 fi
 
-# Parse --monitor-tmpfile argument passed from user-space invocation
+# Parse arguments passed from user-space invocation
 MONITOR_TMPFILE=""
+AUR_TMPFILE=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --monitor-tmpfile) MONITOR_TMPFILE="$2"; shift 2 ;;
+        --aur-tmpfile)     AUR_TMPFILE="$2";     shift 2 ;;
         *) shift ;;
     esac
 done
 
-# Preserve calling user's UID for chown at end
 CALLER_USER="${SUDO_USER:-$USER}"
-CALLER_UID=$(id -u "$CALLER_USER" 2>/dev/null)
 
-# 2. Metadata & dynamic naming (format: distroname_YYYY.MM.DD_HHMM)
-DISTRO_ID=$(grep "^ID=" /etc/os-release | cut -d'=' -f2 | tr -d '"')
-DATE_TAG=$(date "+%Y.%m.%d")
+# ==============================================================================
+# 2. Metadata & dynamic naming
+# ==============================================================================
+DISTRO_ID=$(grep "^ID=" /etc/os-release 2>/dev/null | cut -d'=' -f2 | tr -d '"' || echo "unknown")
+DATE_TAG=$(date "+%Y_%m_%d")
 TIME_TAG=$(date "+%H%M")
 OUTPUT="${DISTRO_ID}_${DATE_TAG}_${TIME_TAG}.txt"
-
-# 3. Hardware metadata & environment
 TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
 HOSTNAME_STR=$(hostname)
-CPU_FULL=$(grep "model name" /proc/cpuinfo | head -n1 | cut -d':' -f2 | xargs)
 
-# 3b. Extended hardware metadata
+# ==============================================================================
+# 3. CPU
+# ==============================================================================
+CPU_FULL=$(grep "model name" /proc/cpuinfo 2>/dev/null | head -n1 | cut -d':' -f2 | xargs || echo "unknown")
+CPU_CORES_PHYS=$(grep "cpu cores" /proc/cpuinfo 2>/dev/null | head -n1 | awk -F': ' '{print $2}' || echo "?")
+CPU_THREADS=$(grep -c "^processor" /proc/cpuinfo 2>/dev/null || echo "?")
 
-# Motherboard (DMI sysfs)
-MB_VENDOR=$(cat /sys/class/dmi/id/board_vendor  2>/dev/null | xargs)
-MB_NAME=$(cat   /sys/class/dmi/id/board_name    2>/dev/null | xargs)
-MB_VER=$(cat    /sys/class/dmi/id/board_version 2>/dev/null | xargs)
-MAINBOARD="${MB_VENDOR} ${MB_NAME}${MB_VER:+ (${MB_VER})}"
-
-# Storage devices (physical block devices only, no loop/zram devices)
-STORAGE=$(lsblk -d -o NAME,SIZE,MODEL,TRAN --noheadings 2>/dev/null \
-    | grep -vE "^(loop|zram)" \
-    | awk '{printf "  - /dev/%-6s %6s  %-30s [%s]\n", $1, $2, $3, $4}')
-[ -z "$STORAGE" ] && STORAGE="  (no block devices detected)"
-
-# Monitors: read from tmpfile written by user-space invocation (before sudo).
-# Falls back to DRM sysfs if tmpfile absent or empty.
-# Note on DRM fallback: NVIDIA only writes EDID to sysfs when compositor holds
-# DRM ownership – under root without session the file is always empty.
-MONITORS=""
-if [ -n "$MONITOR_TMPFILE" ] && [ -s "$MONITOR_TMPFILE" ]; then
-    MONITORS=$(cat "$MONITOR_TMPFILE")
-    rm -f "$MONITOR_TMPFILE"
-else
-    rm -f "$MONITOR_TMPFILE"
-    # DRM sysfs fallback (EDID will be empty under sudo without compositor ownership)
-    for conn_path in /sys/class/drm/card*-*/; do
-        [ -f "${conn_path}status" ] || continue
-        [ "$(cat "${conn_path}status" 2>/dev/null)" = "connected" ] || continue
-        conn=$(basename "$conn_path")
-        mon_name=""
-        edid_file="${conn_path}edid"
-        if [ -f "$edid_file" ] && [ -s "$edid_file" ]; then
-            mon_name=$(python3 - "$edid_file" 2>/dev/null <<'PYEOF'
-import sys
-data = open(sys.argv[1], 'rb').read()
-found = False
-for i in range(4):
-    o = 54 + i * 18
-    if len(data) > o + 17 and data[o:o+3] == b'\x00\x00\x00' and data[o+3] == 0xfc:
-        print(data[o+5:o+18].decode('ascii', 'ignore').strip())
-        found = True
-        break
-if not found:
-    print("__NO_DESCRIPTOR__")
-PYEOF
-)
-            if [ "$mon_name" = "__NO_DESCRIPTOR__" ]; then
-                mon_name="connected (EDID present, no 0xFC monitor name descriptor)"
-            elif [ -z "$mon_name" ]; then
-                mon_name="connected (Python3 error reading EDID)"
-            fi
-        elif [ -f "$edid_file" ]; then
-            mon_name="connected (EDID empty – kscreen-doctor not available, no compositor ownership)"
-        else
-            mon_name="connected (no EDID file in DRM sysfs)"
-        fi
-        MONITORS="${MONITORS}  - ${conn}: ${mon_name}"$'\n'
-    done
-    [ -z "$MONITORS" ] && MONITORS="  (no connected monitors detected)"
-fi
-
-# NICs (PCI-based)
-NICS=$(lspci -mm 2>/dev/null \
-    | grep -iE '"(Ethernet|Network|Wireless|Wi-Fi|WLAN|InfiniBand)' \
-    | awk -F'"' '{print "  - " $4 ": " $6}')
-[ -z "$NICS" ] && NICS="  (none detected via lspci)"
-
-# Sound cards
-# PCI: raw lspci audio entries
-# ALSA: human-readable card list; HDMI audio endpoints may appear in both – deduplicated below
-SOUND_PCI=$(lspci 2>/dev/null | grep -iE "audio|sound" | sed 's/^/  [PCI] /')
-SOUND_ALSA=$(aplay -l 2>/dev/null | grep "^card" | sed 's/^/  [ALSA] /')
-SOUND=$(printf "%s\n%s" "$SOUND_PCI" "$SOUND_ALSA" \
-    | grep -v '^$' \
-    | awk '!seen[$0]++')
-[ -z "$SOUND" ] && SOUND="  (none detected)"
-
-# Keyboards & mice
-# Blacklist: Power Button, Video Bus, PC Speaker, WMI hotkeys,
-# Consumer/System Control register kbd handler but are not physical keyboards.
-INPUT_KB=$(awk 'BEGIN{RS=""; FS="\n"}
-    /Handlers=[^\n]*kbd/ {
-        for(i=1;i<=NF;i++) if($i~/^N:/) {
-            name=$i
-            gsub(/N: Name=|"/,"",name)
-            if(name !~ /[Pp]ower [Bb]utton|[Vv]ideo [Bb]us|[Pp][Cc] [Ss]peaker|[Ww][Mm][Ii]|[Cc]onsumer [Cc]ontrol|[Ss]ystem [Cc]ontrol/) {
-                print "  - " name
-            }
-        }
-    }' /proc/bus/input/devices 2>/dev/null | sort -u)
-[ -z "$INPUT_KB" ] && INPUT_KB="  (none detected)"
-
-INPUT_MOUSE=$(awk 'BEGIN{RS=""; FS="\n"}
-    /Handlers=[^\n]*mouse/ {
-        for(i=1;i<=NF;i++) if($i~/^N:/) {
-            gsub(/N: Name=|"/,"",$i); print "  - " $i
-        }
-    }' /proc/bus/input/devices 2>/dev/null | sort -u)
-[ -z "$INPUT_MOUSE" ] && INPUT_MOUSE="  (none detected)"
-
-# 4. Architecture level validation
-# x86-64-v4 requires avx512f + avx512cd + avx512bw + avx512dq + avx512vl (all five).
-# Partial AVX-512 (e.g. Alder Lake P-cores) must not incorrectly report v4.
-CPU_FLAGS=$(grep "^flags" /proc/cpuinfo | head -n1)
+CPU_FLAGS=$(grep "^flags" /proc/cpuinfo 2>/dev/null | head -n1)
 if echo "$CPU_FLAGS" | grep -qw "avx512f"  && \
    echo "$CPU_FLAGS" | grep -qw "avx512cd" && \
    echo "$CPU_FLAGS" | grep -qw "avx512bw" && \
@@ -205,47 +107,287 @@ else
     ARCH_LVL="x86-64-v1 (baseline)"
 fi
 
-# 5. Hierarchical GPU validation (kernel level -> fallback -> FOSS)
-GPU_DRV_RAW=$(lspci -k | grep -A 3 -E "VGA|3D" | grep "Kernel driver in use" \
-    | awk -F': ' '{print $2}' \
-    | grep -v 'snd_hda_intel' \
-    | grep -v '^$' \
-    | head -n1 \
-    | xargs)
+# ==============================================================================
+# 4. RAM
+# ==============================================================================
+RAM_TOTAL=$(awk '/^MemTotal:/ {printf "%.1f GiB", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo "unknown")
+RAM_AVAIL=$(awk '/^MemAvailable:/ {printf "%.1f GiB", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo "unknown")
 
-# Open-kernel detection: "Open Kernel Module" string present since driver 515+
-# Verify string on your system: cat /proc/driver/nvidia/version
+# DMI: Slot-Belegung, Takt, Kapazität pro DIMM
+RAM_DIMMS=$(dmidecode -t memory 2>/dev/null \
+    | awk '
+        /^Memory Device$/ { in_dev=1; size=""; speed=""; type=""; loc="" }
+        in_dev && /^\tSize:/ {
+            if ($2 == "No") next   # "No Module Installed"
+            size=$2" "$3
+        }
+        in_dev && /^\tConfigured Memory Speed:/ { speed=$4" "$5 }
+        in_dev && /^\tType:/ && !/Type Detail/ { type=$2 }
+        in_dev && /^\tLocator:/ && !/Bank/ { loc=$2 }
+        in_dev && /^$/ {
+            if (size != "") printf "  - %-12s %s  %s  %s\n", loc, size, type, speed
+            in_dev=0
+        }
+    ' || echo "  (dmidecode unavailable)")
+[ -z "$RAM_DIMMS" ] && RAM_DIMMS="  (no DIMM data)"
+
+# EXPO/XMP: Überprüfung ob OC-Profil aktiv ist via DMI Configured Speed vs Max Speed
+RAM_XMP=$(dmidecode -t memory 2>/dev/null \
+    | awk '
+        /^Memory Device$/ { max=""; cfg="" }
+        /^\tSpeed:/ && !/Configured/ { max=$2 }
+        /^\tConfigured Memory Speed:/ { cfg=$4 }
+        /^$/ {
+            if (max != "" && cfg != "" && cfg > max) {
+                print "  EXPO/XMP active: Configured " cfg " MT/s > Rated " max " MT/s"
+            }
+        }
+    ' | head -n1)
+[ -z "$RAM_XMP" ] && RAM_XMP="  EXPO/XMP: not detected (running at rated speed or dmidecode insufficient)"
+
+# ==============================================================================
+# 5. GPU
+# ==============================================================================
+GPU_MODELS=$(/usr/bin/lspci 2>/dev/null | grep -E "VGA|3D Controller" | sed 's/^.*: //')
+[ -z "$GPU_MODELS" ] && GPU_MODELS="(none detected)"
+
+GPU_DRV_RAW=$(/usr/bin/lspci -k 2>/dev/null \
+    | awk '/VGA|3D Controller/{found=1} found && /Kernel driver in use:/{print $NF; found=0}' \
+    | head -n1 | xargs || echo "")
+
+GPU_TYPE="Unknown"
+GPU_VER="N/A"
+GPU_VRAM="unknown"
+
 if grep -q "Open Kernel Module" /proc/driver/nvidia/version 2>/dev/null; then
     GPU_TYPE="NVIDIA Open-Kernel (proprietary user-space)"
-    GPU_VER=$(grep -oE "[0-9]+\.[0-9]+\.[0-9]+" /proc/driver/nvidia/version 2>/dev/null | head -n1)
+    GPU_VER=$(grep -oE "[0-9]+\.[0-9]+\.[0-9]+" /proc/driver/nvidia/version 2>/dev/null | head -n1 || echo "N/A")
+    # VRAM aus nvidia-smi (zuverlässiger als /proc)
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        GPU_VRAM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null \
+            | awk '{printf "%.0f MiB", $1}' | head -n1 || echo "unknown")
+    fi
 elif [ -d /proc/driver/nvidia/ ]; then
     GPU_TYPE="NVIDIA proprietary (legacy/closed)"
     GPU_VER=$(grep -oE "[0-9]+\.[0-9]+\.[0-9]+" /proc/driver/nvidia/version 2>/dev/null | head -n1)
-    [ -z "$GPU_VER" ] && GPU_VER=$(modinfo -F version nvidia 2>/dev/null)
-elif lsmod | grep -q "^nouveau"; then
+    [ -z "$GPU_VER" ] && GPU_VER=$(modinfo -F version nvidia 2>/dev/null || echo "N/A")
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        GPU_VRAM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null \
+            | awk '{printf "%.0f MiB", $1}' | head -n1 || echo "unknown")
+    fi
+elif lsmod 2>/dev/null | grep -q "^nouveau"; then
     GPU_TYPE="Nouveau (open source)"
     GPU_VER="N/A"
-elif lsmod | grep -q "^amdgpu"; then
+elif lsmod 2>/dev/null | grep -q "^amdgpu"; then
     GPU_TYPE="AMDGPU (open source)"
-    GPU_VER=$(modinfo -F version amdgpu 2>/dev/null || echo "N/A")
-elif lsmod | grep -q "^i915"; then
+    # modinfo -F version liefert Kernel-Version, nicht AMDGPU-Treiberversion.
+    # Mesa ist die relevante Userspace-Komponente (entspricht funktional dem NVIDIA-Treiberpaket).
+    GPU_VER=$(pacman -Q mesa 2>/dev/null | awk '{print "mesa " $2}' || echo "N/A")
+    # VRAM aus sysfs — Glob über alle DRM-Cards, erste AMDGPU-Card nehmen
+    _vram_path=$(grep -rl "amdgpu" /sys/class/drm/card*/device/driver/module/drivers 2>/dev/null \
+        | head -n1 | sed 's|/driver/module/drivers.*||')
+    # Fallback: erstes card*-Verzeichnis mit mem_info_vram_total
+    if [ -z "$_vram_path" ]; then
+        _vram_path=$(ls /sys/class/drm/card*/device/mem_info_vram_total 2>/dev/null \
+            | head -n1 | sed 's|/mem_info_vram_total||')
+    fi
+    if [ -n "$_vram_path" ] && [ -f "${_vram_path}/mem_info_vram_total" ]; then
+        GPU_VRAM=$(awk '{printf "%.0f MiB", $1/1024/1024}' \
+            "${_vram_path}/mem_info_vram_total" 2>/dev/null || echo "unknown")
+    fi
+elif lsmod 2>/dev/null | grep -q "^i915"; then
     GPU_TYPE="Intel i915 (open source)"
-    GPU_VER=$(modinfo -F version i915 2>/dev/null || echo "N/A")
+    GPU_VER=$(pacman -Q mesa 2>/dev/null | awk '{print "mesa " $2}' || echo "N/A")
 else
     GPU_TYPE="Generic / Other (${GPU_DRV_RAW:-unknown})"
-    GPU_VER=$(modinfo -F version "$GPU_DRV_RAW" 2>/dev/null || echo "N/A")
+    [ -n "$GPU_DRV_RAW" ] && GPU_VER=$(modinfo -F version "$GPU_DRV_RAW" 2>/dev/null || echo "N/A")
 fi
 
-# 6. Repository audit & glibc validation
-# pacman-conf --repo-list: parses only active repos, ignores inline comments
-# and commented-out repo blocks that grep "^\[" would incorrectly include.
-REPOS_ACTIVE=$(pacman-conf --repo-list 2>/dev/null | xargs)
+# ==============================================================================
+# 6. Motherboard & Storage
+# ==============================================================================
+MB_VENDOR=$(cat /sys/class/dmi/id/board_vendor  2>/dev/null | xargs || echo "unknown")
+MB_NAME=$(cat   /sys/class/dmi/id/board_name    2>/dev/null | xargs || echo "unknown")
+MB_VER=$(cat    /sys/class/dmi/id/board_version 2>/dev/null | xargs)
+MAINBOARD="${MB_VENDOR} ${MB_NAME}${MB_VER:+ (${MB_VER})}"
+
+STORAGE=$(/usr/bin/lsblk -d -o NAME,SIZE,MODEL,TRAN --noheadings 2>/dev/null \
+    | grep -vE "^(loop|zram)" \
+    | awk '{printf "  - /dev/%-10s %7s  %-30s [%s]\n", $1, $2, $3, $4}')
+[ -z "$STORAGE" ] && STORAGE="  (no block devices detected)"
+
+# SMART-Status (nur physische Disks, kein loop/zram/nvme-partitionen)
+SMART_STATUS=""
+while IFS= read -r line; do
+    dev=$(echo "$line" | awk '{print $1}')
+    [ -b "/dev/$dev" ] || continue
+    result=$(smartctl -H "/dev/$dev" 2>/dev/null \
+        | awk '/overall-health|SMART overall/{
+            if (/PASSED|OK/) print "PASSED"
+            else if (/FAILED/) print "FAILED"
+        }')
+    [ -z "$result" ] && result="N/A (NVMe/unsupported)"
+    SMART_STATUS="${SMART_STATUS}  - /dev/${dev}: ${result}\n"
+done < <(/usr/bin/lsblk -d -o NAME,TRAN --noheadings 2>/dev/null | grep -vE "^(loop|zram)")
+[ -z "$SMART_STATUS" ] && SMART_STATUS="  (no devices checked)"
+
+# ==============================================================================
+# 7. Monitors (Plasma 6 kscreen-doctor Parser)
+# ==============================================================================
+MONITORS=""
+if [ -n "$MONITOR_TMPFILE" ] && [ -s "$MONITOR_TMPFILE" ]; then
+    MONITORS=$(awk '
+    /^Output:/ {
+        if (connector != "") {
+            printf "  Output: %-6s  %-12s @ %-10s  HDR: %-10s  VRR: %s\n",
+                connector, geometry, refresh, hdr, vrr
+        }
+        connector = $3
+        geometry = ""; refresh = ""; hdr = "N/A"; vrr = "N/A"
+        next
+    }
+    /^\tGeometry:/ {
+        # "Geometry: X,Y WxH" — nur WxH (Feld 3 nach split auf Leerzeichen)
+        n = split($0, a, " ")
+        geometry = a[n]
+        next
+    }
+    /^\tModes:/ {
+        # Aktiver Mode hat "*" (aktuell laufend)
+        if (match($0, /[0-9]+x[0-9]+@([0-9.]+)\*/, m)) {
+            split(m[0], b, "@")
+            refresh = b[2]
+            gsub(/[*!]/, "", refresh)
+            refresh = refresh " Hz"
+        }
+        next
+    }
+    /^\tHDR:/ { hdr = $2; next }
+    /^\tVrr:/ { vrr = $2; next }
+    END {
+        if (connector != "") {
+            printf "  Output: %-6s  %-12s @ %-10s  HDR: %-10s  VRR: %s\n",
+                connector, geometry, refresh, hdr, vrr
+        }
+    }
+    ' "$MONITOR_TMPFILE")
+fi
+
+if [ -z "$MONITORS" ]; then
+    MONITORS="  (Monitor info from kscreen-doctor unavailable)"
+    shopt -s nullglob
+    for conn_path in /sys/class/drm/card*-*/; do
+        [ -f "${conn_path}status" ] || continue
+        [ "$(cat "${conn_path}status" 2>/dev/null)" = "connected" ] || continue
+        conn=$(basename "$conn_path")
+        MONITORS="${MONITORS}"$'\n'"  - ${conn}: (DRM fallback; run kscreen-doctor from user session)"
+    done
+    shopt -u nullglob
+fi
+[ -z "$MONITORS" ] && MONITORS="  (no connected monitors detected)"
+
+# ==============================================================================
+# 8. NICs & Netzwerk (IPs und MACs geschwärzt für öffentliche Logs)
+# ==============================================================================
+NICS=$(/usr/bin/lspci -mm 2>/dev/null \
+    | grep -iE '"(Ethernet|Network|Wireless|Wi-Fi|WLAN|InfiniBand)' \
+    | awk -F'"' '{print "  - " $4 ": " $6}')
+[ -z "$NICS" ] && NICS="  (none detected via lspci)"
+
+# Aktive Interfaces: Name, Status, Typ — IPs, MACs und ZeroTier-Namen geschwärzt.
+# ZeroTier Interface-Namen sind aus der Network-ID abgeleitet und gelten als sensitiv.
+NET_INTERFACES=$(ip -o link show 2>/dev/null \
+    | grep -v "^[0-9]*: lo:" \
+    | awk '{
+        iface = $2; gsub(/:/, "", iface)
+        state = "DOWN"
+        if ($0 ~ /state UP/) state = "UP"
+        type = "ethernet"
+        if (iface ~ /^wl/)           type = "wifi"
+        if (iface ~ /^zt/)         { type = "zerotier"; iface = "[redacted]" }
+        if (iface ~ /^tun|^wg/)      type = "vpn"
+        if (iface ~ /^br-|^virbr/)  { type = "bridge";    iface = "[redacted]" }
+        if (iface ~ /^br$/)           type = "bridge"
+        if (iface ~ /^docker|^veth/)  type = "container"
+        printf "  - %-18s [%s]  state: %s\n", iface, type, state
+    }')
+[ -z "$NET_INTERFACES" ] && NET_INTERFACES="  (none detected)"
+
+# DNS-Server: resolvectl liefert die tatsächlichen Upstream-Server pro Interface.
+# /etc/resolv.conf zeigt bei systemd-resolved nur 127.0.0.53 (Stub) — nicht auditrelevant.
+DNS_SERVERS=""
+if command -v resolvectl >/dev/null 2>&1; then
+    DNS_SERVERS=$(resolvectl status 2>/dev/null \
+        | awk '
+            /^Link [0-9]+ \(/ {
+                iface = $0; gsub(/.*\(|\).*/, "", iface)
+            }
+            /Current DNS Server:|DNS Servers:/ {
+                for (i=NF; i>=1; i--) {
+                    if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$|^[0-9a-fA-F:]+:[0-9a-fA-F:]+$/) {
+                        printf "  - %-10s %s\n", iface ":", $i
+                    }
+                }
+            }
+        ' | sort -u)
+fi
+# Fallback: resolv.conf (nur wenn resolvectl nicht verfügbar oder leer)
+if [ -z "$DNS_SERVERS" ]; then
+    DNS_SERVERS=$(grep "^nameserver" /etc/resolv.conf 2>/dev/null \
+        | grep -v "127.0.0.53" \
+        | awk '{print "  - " $2}')
+fi
+[ -z "$DNS_SERVERS" ] && DNS_SERVERS="  (none configured or systemd-resolved stub only)"
+
+# ==============================================================================
+# 9. Sound
+# ==============================================================================
+SOUND=$(/usr/bin/lspci 2>/dev/null | grep -iE "Audio device" | sed 's/^/  [PCI] /')
+[ -z "$SOUND" ] && SOUND="  (none detected)"
+
+# ==============================================================================
+# 10. Input devices
+# ==============================================================================
+INPUT_KB=$(awk 'BEGIN{RS=""; FS="\n"}
+    /Handlers=[^\n]*kbd/ {
+        for(i=1;i<=NF;i++) if($i~/^N:/) {
+            name=$i
+            gsub(/N: Name=|"/,"",name)
+            if(name !~ /[Pp]ower [Bb]utton|[Vv]ideo [Bb]us|[Pp][Cc] [Ss]peaker|[Ww][Mm][Ii]|[Cc]onsumer [Cc]ontrol|[Ss]ystem [Cc]ontrol/) {
+                print "  - " name
+            }
+        }
+    }' /proc/bus/input/devices 2>/dev/null | sort -u || true)
+[ -z "$INPUT_KB" ] && INPUT_KB="  (none detected)"
+
+INPUT_MOUSE=$(awk 'BEGIN{RS=""; FS="\n"}
+    /Handlers=[^\n]*mouse/ {
+        for(i=1;i<=NF;i++) if($i~/^N:/) {
+            gsub(/N: Name=|"/,"",$i); print "  - " $i
+        }
+    }' /proc/bus/input/devices 2>/dev/null | sort -u || true)
+[ -z "$INPUT_MOUSE" ] && INPUT_MOUSE="  (none detected)"
+
+# ==============================================================================
+# 11. Swap
+# ==============================================================================
+SWAP_INFO=$(swapon --show=NAME,TYPE,SIZE,USED --noheadings 2>/dev/null \
+    | awk '{printf "  - %-20s type: %-10s size: %-8s used: %s\n", $1, $2, $3, $4}')
+if [ -z "$SWAP_INFO" ]; then
+    # zram-generator erzeugt ggf. swap der in swapon noch nicht sichtbar ist beim ersten Boot
+    SWAP_INFO="  (no active swap)"
+fi
+SWAP_TOTAL=$(awk '/^SwapTotal:/ {printf "%.1f GiB", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo "0")
+SWAP_FREE=$(awk  '/^SwapFree:/  {printf "%.1f GiB", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo "0")
+
+# ==============================================================================
+# 12. Repository audit & glibc validation
+# ==============================================================================
+REPOS_ACTIVE=$(pacman-conf --repo-list 2>/dev/null | xargs || echo "unknown")
 FIRST_REPO=$(echo "$REPOS_ACTIVE" | awk '{print $1}')
 
-GLIBC_VER=$(pacman -Q glibc 2>/dev/null | awk '{print $2}')
+GLIBC_VER=$(pacman -Q glibc 2>/dev/null | awk '{print $2}' || echo "unknown")
 
-# pacman -Qi "From repo" is unreliable on CachyOS (field often absent).
-# pacman -Sl per repo is deterministic: first hit = install source, mirrors pacman priority.
 GLIBC_REPO="unknown"
 for _repo in $REPOS_ACTIVE; do
     if pacman -Sl "$_repo" 2>/dev/null | awk '{print $2}' | grep -qx "glibc"; then
@@ -266,43 +408,130 @@ else
     OPT_STATUS="Standard Arch Linux (no CPU-specific optimizations)"
 fi
 
-# 7. Software & kernel status
+# ==============================================================================
+# 13. Kernel & Microcode
+# ==============================================================================
 KERNEL_RUN=$(uname -r)
-# Regex covers linux-hardened, linux-rt, linux-rt-lts, linux-cachyos-bore, etc.
-# Excludes -headers and -firmware packages.
+KERNEL_PARAMS=$(cat /proc/cmdline 2>/dev/null || echo "(unavailable)")
 KERNEL_INST=$(pacman -Q 2>/dev/null | grep -E '^linux(-[a-z0-9]+([-][a-z0-9]+)*)? ' \
     | grep -v '\-headers' \
     | grep -v '\-firmware' \
-    | awk '{print $1 " v" $2}')
+    | awk '{print $1 " v" $2}' || echo "")
 UCODE=$(pacman -Qq 2>/dev/null | grep -E '^(amd|intel)-ucode$' || echo "NOT INSTALLED")
 
-# 8. AUR helper check
-if command -v paru >/dev/null 2>&1; then
-    AUR_HELP="paru"
-    AUR_CMD="paru -Qu"
-elif command -v yay >/dev/null 2>&1; then
-    AUR_HELP="yay"
-    AUR_CMD="yay -Qu"
-else
-    AUR_HELP="none"
-    AUR_CMD=""
+# ==============================================================================
+# 14. Disk-Nutzung (alle Mounts, nicht nur kritische)
+# ==============================================================================
+DISK_USAGE=$(df -h --output=source,fstype,size,used,avail,pcent,target 2>/dev/null \
+    | grep -vE "^(tmpfs|devtmpfs|efivarfs|Filesystem|overlay|udev)" \
+    | awk 'NR==1{printf "  %-30s %-8s %6s %6s %6s %5s  %s\n",$1,$2,$3,$4,$5,$6,$7; next}
+           {printf "  %-30s %-8s %6s %6s %6s %5s  %s\n",$1,$2,$3,$4,$5,$6,$7}')
+[ -z "$DISK_USAGE" ] && DISK_USAGE="  (df failed)"
+
+CRIT=$(df -h 2>/dev/null | awk 'NR>1 && int($5) >= 90 {print "  ! WARNING: " $6 " is " $5 " full !"}' || echo "")
+[ -z "$CRIT" ] && CRIT="  No critical fill levels (>=90%)."
+
+# ==============================================================================
+# 15. Systemd failed units
+# ==============================================================================
+FAILED_UNITS=$(systemctl --failed --no-legend --plain 2>/dev/null \
+    | awk '{print "  ! " $1 " (" $2 ")"}')
+[ -z "$FAILED_UNITS" ] && FAILED_UNITS="  No failed units."
+
+# ==============================================================================
+# 16. Proton / Steam (installierte Versionen)
+# ==============================================================================
+PROTON_VERS=""
+
+# Home-Verzeichnis des aufrufenden Users bestimmen
+CALLER_HOME=$(getent passwd "$CALLER_USER" 2>/dev/null | cut -d: -f6)
+
+# Steam-Root ermitteln (symlink ~/.steam/steam zeigt auf ~/.local/share/Steam)
+_steam_root=""
+for _candidate in \
+    "${CALLER_HOME}/.local/share/Steam" \
+    "${CALLER_HOME}/.steam/steam"; do
+    [ -d "$_candidate/steamapps" ] && _steam_root="$_candidate" && break
+done
+
+if [ -n "$_steam_root" ]; then
+    # Offizielle Valve Proton-Versionen: nur "Proton X.Y" Pattern (nicht BattlEye/Hotfix/Next)
+    while IFS= read -r -d '' _pdir; do
+        _pname=$(basename "$_pdir")
+        [[ "$_pname" =~ ^Proton\ [0-9] ]] || continue
+        PROTON_VERS="${PROTON_VERS}  - [Steam] ${_pname}\n"
+    done < <(find "$_steam_root/steamapps/common" -maxdepth 1 -type d -print0 2>/dev/null)
+
+    # GE-Proton und andere Custom-Tools aus compatibilitytools.d
+    _compat_dir="$_steam_root/compatibilitytools.d"
+    if [ -d "$_compat_dir" ]; then
+        while IFS= read -r -d '' _tdir; do
+            _tname=$(basename "$_tdir")
+            PROTON_VERS="${PROTON_VERS}  - [compat] ${_tname}\n"
+        done < <(find "$_compat_dir" -maxdepth 1 -mindepth 1 -type d -print0 2>/dev/null)
+    fi
 fi
 
-# 9. Report generation
+# System-seitig installierte Proton/Wine-Pakete via pacman.
+# Explizit ausgeschlossen: protonplus, protonup-qt, protontricks (Tools, keine Runtimes)
+SYS_PROTON=$(pacman -Q 2>/dev/null \
+    | grep -iE "^(proton-|wine-cachyos|wine-staging|wine-tkg)" \
+    | grep -viE "^(protonplus|protonup|protontricks)" \
+    | awk '{print "  - [pacman] " $1 " " $2}')
+[ -n "$SYS_PROTON" ] && PROTON_VERS="${PROTON_VERS}${SYS_PROTON}\n"
+
+[ -z "$PROTON_VERS" ] && PROTON_VERS="  (none found)"
+
+# ==============================================================================
+# 17. AUR data (aus User-Tmpfile)
+# ==============================================================================
+AUR_HELP="none"
+AUR_UPDATES=""
+AUR_FOREIGN=""
+
+if [ -n "$AUR_TMPFILE" ] && [ -s "$AUR_TMPFILE" ]; then
+    AUR_HELP=$(grep "^HELPER=" "$AUR_TMPFILE" | cut -d'=' -f2)
+    if [ "$AUR_HELP" != "none" ]; then
+        AUR_UPDATES=$(sed -n '/^UPDATES_START$/,/^UPDATES_END$/p' "$AUR_TMPFILE" \
+            | grep -v "^UPDATES_")
+        AUR_FOREIGN=$(sed -n '/^FOREIGN_START$/,/^FOREIGN_END$/p' "$AUR_TMPFILE" \
+            | grep -v "^FOREIGN_")
+    fi
+fi
+
+# ==============================================================================
+# 18. Report generation
+# ==============================================================================
 {
     printf "######################################################\n"
     printf "             SYSTEM AUDIT: %s\n" "$HOSTNAME_STR"
     printf "             TIMESTAMP: %s\n" "$TIMESTAMP"
     printf "######################################################\n"
 
+    # ------------------------------------------------------------------
     printf "\n[HARDWARE & GRAPHICS]\n"
     echo "------------------------------------------------------"
-    printf "%-30s : %s\n" "CPU model"             "$CPU_FULL"
+    printf "%-30s : %s (%s cores / %s threads)\n" "CPU model" "$CPU_FULL" "$CPU_CORES_PHYS" "$CPU_THREADS"
     printf "%-30s : %s\n" "Instruction set level" "$ARCH_LVL"
+    printf "%-30s : %s\n" "GPU model"             "$GPU_MODELS"
     printf "%-30s : %s\n" "Active driver"         "${GPU_DRV_RAW:-NONE}"
     printf "%-30s : %s\n" "Driver type"           "$GPU_TYPE"
     printf "%-30s : %s\n" "Driver version"        "${GPU_VER:-N/A}"
+    printf "%-30s : %s\n" "GPU VRAM"              "$GPU_VRAM"
 
+    # ------------------------------------------------------------------
+    printf "\n[MEMORY]\n"
+    echo "------------------------------------------------------"
+    printf "%-30s : %s  (available: %s)\n" "RAM total" "$RAM_TOTAL" "$RAM_AVAIL"
+    printf "\nDIMM slots:\n"
+    echo "$RAM_DIMMS"
+    printf "\n%s\n" "$RAM_XMP"
+
+    printf "\nSwap:\n"
+    printf "  Total: %s  Free: %s\n" "$SWAP_TOTAL" "$SWAP_FREE"
+    echo "$SWAP_INFO"
+
+    # ------------------------------------------------------------------
     printf "\n[HARDWARE DETAILS]\n"
     echo "------------------------------------------------------"
     printf "%-30s : %s\n" "Motherboard" "$MAINBOARD"
@@ -310,15 +539,17 @@ fi
     printf "\nStorage devices:\n"
     echo "$STORAGE"
 
+    printf "\nSMART health:\n"
+    printf "%b" "$SMART_STATUS"
+
     printf "\nMonitors:\n"
-    if [ -n "$MONITORS" ]; then
-        echo "$MONITORS" | sed 's/^/  /'
-    else
-        echo "  (no monitor data)"
-    fi
+    echo "$MONITORS"
 
     printf "\nNetwork cards (NICs):\n"
     echo "$NICS"
+
+    printf "\nActive interfaces (IPs/MACs/sensitive names redacted):\n"
+    echo "$NET_INTERFACES"
 
     printf "\nSound cards:\n"
     echo "$SOUND"
@@ -329,6 +560,7 @@ fi
     printf "\nMice:\n"
     echo "$INPUT_MOUSE"
 
+    # ------------------------------------------------------------------
     printf "\n[REPOSITORIES & OPTIMIZATION]\n"
     echo "------------------------------------------------------"
     printf "%-30s : %s\n" "Optimization status"  "$OPT_STATUS"
@@ -338,6 +570,7 @@ fi
     printf "\nActive pacman repositories (priority order):\n"
     echo "$REPOS_ACTIVE" | tr ' ' '\n' | sed 's/^/  - /'
 
+    # ------------------------------------------------------------------
     printf "\n[KERNEL & MICROCODE]\n"
     echo "------------------------------------------------------"
     printf "%-30s : %s\n" "Running kernel"   "$KERNEL_RUN"
@@ -348,27 +581,54 @@ fi
     else
         echo "  (no linux packages found via pacman)"
     fi
+    printf "\nKernel parameters:\n  %s\n" "$KERNEL_PARAMS"
 
+    # ------------------------------------------------------------------
     printf "\n[STORAGE & FILESYSTEM]\n"
     echo "------------------------------------------------------"
-    findmnt -n -o SOURCE,FSTYPE,OPTIONS / \
-        | awk '{printf "%-30s : %s (%s)\n", "Root mount", $1, $2}'
-    printf "\nCritical partitions (>90%%):\n"
-    CRIT=$(df -h | awk 'NR>1 && int($5) >= 90 {print "  ! WARNING: " $6 " is " $5 " full !"}')
-    [ -n "$CRIT" ] && echo "$CRIT" || echo "  No critical fill levels."
+    findmnt -n -o SOURCE,FSTYPE,OPTIONS / 2>/dev/null \
+        | awk '{printf "%-30s : %s (%s)\n", "Root mount", $1, $2}' || \
+        printf "%-30s : %s\n" "Root mount" "(unable to determine)"
 
+    printf "\nDisk usage (all mounts):\n"
+    echo "$DISK_USAGE"
+
+    printf "\nCritical partitions (>=90%%):\n"
+    echo "$CRIT"
+
+    # ------------------------------------------------------------------
+    printf "\n[SYSTEMD]\n"
+    echo "------------------------------------------------------"
+    printf "Failed units:\n"
+    echo "$FAILED_UNITS"
+
+    # ------------------------------------------------------------------
+    printf "\n[NETWORK]\n"
+    echo "------------------------------------------------------"
+    printf "Note: IPs and MAC addresses redacted for public log sharing.\n"
+    printf "\nDNS servers (upstream, via resolvectl):\n"
+    echo "$DNS_SERVERS"
+
+    # ------------------------------------------------------------------
+    printf "\n[PROTON & WINE]\n"
+    echo "------------------------------------------------------"
+    printf "%b" "$PROTON_VERS"
+
+    # ------------------------------------------------------------------
     printf "\n[PACKAGE MANAGEMENT & AUR]\n"
     echo "------------------------------------------------------"
     if [ "$AUR_HELP" != "none" ]; then
-        AUR_UPDATES=$($AUR_CMD 2>/dev/null)
         if [ -z "$AUR_UPDATES" ]; then
             printf "AUR status: consistent (up to date)\n"
         else
             printf "Pending AUR updates:\n%s\n" "$AUR_UPDATES"
         fi
-
         printf "\nInstalled foreign packages (AUR):\n"
-        $AUR_HELP -Qm 2>/dev/null | sed 's/^/  - /' || echo "  (none)"
+        if [ -n "$AUR_FOREIGN" ]; then
+            echo "$AUR_FOREIGN" | sed 's/^/  - /'
+        else
+            echo "  (none)"
+        fi
     else
         printf "AUR helper: none installed (paru/yay not found)\n"
     fi
@@ -381,14 +641,20 @@ fi
         echo "  No Flatpaks registered."
     fi
 
+    # ------------------------------------------------------------------
     printf "\n[FULL PACKAGE INVENTORY (PACMAN)]\n"
     echo "------------------------------------------------------"
-    pacman -Q 2>/dev/null
+    pacman -Q 2>/dev/null || echo "  (pacman not available or error)"
 
 } > "$OUTPUT"
 
-if [ -n "$CALLER_USER" ]; then
-    chown "${CALLER_USER}":"${CALLER_USER}" "$OUTPUT"
+if [ $? -ne 0 ]; then
+    echo "Error: Fehler beim Schreiben der Ausgabedatei: $OUTPUT" >&2
+    exit 1
+fi
+
+if [ -n "$CALLER_USER" ] && id "$CALLER_USER" >/dev/null 2>&1; then
+    chown "${CALLER_USER}:${CALLER_USER}" "$OUTPUT" 2>/dev/null || true
 fi
 
 printf "\nAudit complete: %s\n" "$OUTPUT"
