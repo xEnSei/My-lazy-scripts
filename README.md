@@ -12,6 +12,7 @@ This script performs a comprehensive system audit, collecting hardware, software
 ## ufw_conf.sh
 This is intended to serve as an example.
 This script configures UFW for gaming and local network services, including NAT optimization and specific port allowances for various applications.
+For certain reasons, I prefer to configure it using this file.
 
 ## nvidia_crashlog.fish
 This script captures and logs crash analysis information related to Nvidia GPUs, including kernel logs and error messages.
