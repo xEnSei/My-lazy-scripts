@@ -16,3 +16,6 @@ This script configures UFW for gaming and local network services, including NAT 
 ## nvidia_crashlog.fish
 This script captures and logs crash analysis information related to Nvidia GPUs, including kernel logs and error messages.
 It also uses paste-cachyos and creates 4 links.
+
+## dlss_scan.fish
+This script checks for required tools, detects GPU architecture, and scans for 'nvngx_dlss.dll' files to evaluate their versions against a minimum recommended version.
